@@ -1,40 +1,23 @@
-#ifndef XUNFEI_STT_SERVICE_H
-#define XUNFEI_STT_SERVICE_H
+#pragma once
 
 #include <string>
-#include <vector>
 #include <functional>
-#include <esp_http_client.h>
 
-// 讯飞语音识别服务
 class XunfeiSttService {
 public:
-    XunfeiSttService();
-    ~XunfeiSttService();
-
-    // 初始化服务
-    bool Initialize(const std::string& appid, const std::string& apikey, const std::string& apisecret);
+    XunfeiSttService(const std::string& app_id, const std::string& api_key, const std::string& api_secret);
     
-    // 识别音频数据（批处理模式）
-    std::string RecognizeAudio(const std::vector<uint8_t>& audio_data);
-    
-    // 设置识别结果回调
-    void SetResultCallback(std::function<void(const std::string& text, bool is_final)> callback);
+    /**
+     * @brief 开始异步语音识别。
+     * 
+     * 在真实实现中，此函数将启动WebSocket连接并开始发送音频流。
+     * 完成识别后，将通过 on_result 回调返回结果。
+     * @param on_result 识别完成后的回调函数，参数为识别出的文本。
+     */
+    void Recognize(std::function<void(const std::string& text)> on_result);
 
 private:
-    // 创建认证URL
-    std::string CreateAuthUrl();
-    
-    // 辅助函数
-    std::string Base64Encode(const std::string& input);
-    std::string HmacSha256(const std::string& key, const std::string& data);
-    std::string FormatRFC1123Date();
-    
-    std::string appid_;
-    std::string apikey_;
-    std::string apisecret_;
-    
-    std::function<void(const std::string& text, bool is_final)> result_callback_;
+    std::string app_id_;
+    std::string api_key_;
+    std::string api_secret_;
 };
-
-#endif // XUNFEI_STT_SERVICE_H
