@@ -12,7 +12,7 @@
 #include <freertos/event_groups.h>
 #include <esp_timer.h>
 
-#include <opus_encoder.h>
+#include "opus.h"
 #include <opus_decoder.h>
 #include <opus_resampler.h>
 
@@ -21,7 +21,8 @@
 #include "processors/audio_debugger.h"
 #include "wake_word.h"
 #include "protocol.h"
-
+// 在适当位置添加
+#include "opus_encoder_wrapper.h"
 
 /*
  * There are two types of audio data flow:

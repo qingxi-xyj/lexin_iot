@@ -490,7 +490,8 @@ void Application::Start() {
         }
     });
     bool protocol_started = protocol_->Start();
-
+    // 在这里添加语音助手初始化
+    InitializeVoicePhotoAssistant();
     SetDeviceState(kDeviceStateIdle);
 
     has_server_time_ = ota.HasServerTime();
@@ -586,6 +587,10 @@ void Application::OnWakeWordDetected() {
     }
 
     if (device_state_ == kDeviceStateIdle) {
+        // 通知语音助手唤醒
+        VoicePhotoAssistant::GetInstance().OnWakeWord();
+        
+        // 继续执行原有代码
         audio_service_.EncodeWakeWord();
 
         if (!protocol_->IsAudioChannelOpened()) {
@@ -694,6 +699,68 @@ void Application::SetDeviceState(DeviceState state) {
 void Application::Reboot() {
     ESP_LOGI(TAG, "Rebooting...");
     esp_restart();
+}
+
+// 在适当位置添加
+void Application::InitializeVoicePhotoAssistant() {
+    auto& assistant = VoicePhotoAssistant::GetInstance();
+    
+    // 设置状态变化回调
+    assistant.SetStateChangeCallback([this](AssistantState state) {
+        OnVoicePhotoAssistantStateChanged(state);
+    });
+    
+    // 初始化助手
+    if (!assistant.Initialize()) {
+        ESP_LOGE(TAG, "Failed to initialize voice photo assistant");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Voice photo assistant initialized successfully");
+}
+
+// 在状态转换处理中添加逻辑，防止不必要的状态重置
+// 在 application.cc 文件中查找并修改这个方法
+// 修复 OnVoicePhotoAssistantStateChanged 方法
+void Application::OnVoicePhotoAssistantStateChanged(AssistantState state) {
+    // 记录当前助手状态
+    ESP_LOGI(TAG, "Voice photo assistant state changed: %d", static_cast<int>(state));
+    
+    // 根据助手状态更新应用状态
+    switch (state) {
+        case kStateListening:
+            SetDeviceState(kDeviceStateListening);
+            break;
+            
+        case kStateProcessingSpeech:
+        case kStateCapturingPhoto:
+        case kStateAnalyzingPhoto:
+        case kStateGeneratingResponse:
+            SetDeviceState(kDeviceStateConnecting);
+            break;
+            
+        case kStateSpeaking:
+            SetDeviceState(kDeviceStateSpeaking);
+            break;
+            
+        case kStateIdle:
+            // 只有在没有活跃对话时才重置到IDLE状态
+            if (device_state_ != kDeviceStateListening && 
+                device_state_ != kDeviceStateSpeaking) {
+                SetDeviceState(kDeviceStateIdle);
+            }
+            break;
+    }
+}
+
+
+
+// 在文件适当位置添加实现
+void Application::SetChatMessage(const char* role, const char* message) {
+    auto display = Board::GetInstance().GetDisplay();
+    if (display) {
+        display->SetChatMessage(role, message);
+    }
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {

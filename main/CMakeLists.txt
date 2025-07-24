@@ -24,6 +24,11 @@ set(SOURCES "audio/audio_codec.cc"
             "settings.cc"
             "device_state_event.cc"
             "main.cc"
+                # 新增文件
+    services/xunfei_stt_service.cc
+    services/doubao_api_service.cc
+    services/private_vision_service.cc
+    assistant/voice_photo_assistant.cc
             )
 
 set(INCLUDE_DIRS "." "display" "audio" "protocols")
@@ -32,7 +37,8 @@ set(INCLUDE_DIRS "." "display" "audio" "protocols")
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
 list(APPEND SOURCES ${BOARD_COMMON_SOURCES})
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
-
+# 在SOURCES列表中添加
+list(APPEND SOURCES "audio/opus_encoder_wrapper.cc")
 # 根据 BOARD_TYPE 配置添加对应的板级文件
 if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
     set(BOARD_TYPE "bread-compact-wifi")
@@ -261,12 +267,14 @@ if(CONFIG_IDF_TARGET_ESP32)
                              )
 endif()
 
+# 在idf_component_register调用中
+# 在idf_component_register中的REQUIRES部分添加spi_flash
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
+                    REQUIRES esp_http_client mqtt app_update esp_app_format spi_flash esp-opus efuse
                     WHOLE_ARCHIVE
                     )
-
 # 使用 target_compile_definitions 来定义 BOARD_TYPE, BOARD_NAME
 # 如果 BOARD_NAME 为空，则使用 BOARD_TYPE
 if(NOT BOARD_NAME)
@@ -335,3 +343,5 @@ spiffs_create_partition_assets(
     MMAP_FILE_SUPPORT_FORMAT ".aaf"
 )
 endif()
+# 在文件末尾添加
+set(EXTRA_COMPONENT_DIRS $ENV{IDF_PATH}/examples/protocols/http_server/ws_echo_server/components)

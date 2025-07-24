@@ -26,6 +26,8 @@ public:
     bool Initialize(AudioCodec* codec);
     void Feed(const std::vector<int16_t>& data);
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
+    // 添加无参数版本
+void OnWakeWordDetected();
     void Start();
     void Stop();
     size_t GetFeedSize();

@@ -195,23 +195,85 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 
     return true;
 }
+// 改进 AudioInputTask 方法 - 移除直接访问AFE组件的代码
+
 
 void AudioService::AudioInputTask() {
+    // 添加任务状态监控
+    uint32_t last_input_count = 0;
+    uint32_t input_count = 0;
+    TickType_t last_monitor_time = xTaskGetTickCount();
+    const TickType_t MONITOR_INTERVAL = pdMS_TO_TICKS(5000); // 5秒监控一次
+
     while (true) {
-        EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
-            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING,
-            pdFALSE, pdFALSE, portMAX_DELAY);
+        // 使用短超时，增加灵活性
+        EventBits_t bits = xEventGroupWaitBits(
+            event_group_, 
+            AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING,
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(50)
+        );
 
         if (service_stopped_) {
             break;
         }
+        
+        // 监控音频处理性能
+        TickType_t current_time = xTaskGetTickCount();
+        if (current_time - last_monitor_time > MONITOR_INTERVAL) {
+            // 计算输入率
+            float input_rate = (input_count - last_input_count) * 1000.0f / 
+                               pdTICKS_TO_MS(MONITOR_INTERVAL);
+            last_input_count = input_count;
+            
+            // 记录性能统计
+            ESP_LOGI(TAG, "Audio processing stats: %.1f frames/sec, queues: encode=%u, decode=%u", 
+                     input_rate,
+                     audio_encode_queue_.size(),
+                     audio_decode_queue_.size());
+                     
+            last_monitor_time = current_time;
+            
+            // 检测异常状态 - 如果队列异常大或输入率为零
+            if ((audio_encode_queue_.size() > 20 || input_rate < 0.5f) && 
+                (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING))) {
+                
+                ESP_LOGW(TAG, "Abnormal audio state detected, resetting audio subsystem");
+                
+                // 重置相关组件，但不直接访问AFE缓冲区
+                if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
+                    EnableWakeWordDetection(false);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    EnableWakeWordDetection(true);
+                }
+                
+                if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
+                    EnableVoiceProcessing(false);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    EnableVoiceProcessing(true);
+                }
+                
+                // 清空所有内部队列
+                std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+                audio_decode_queue_.clear();
+                audio_encode_queue_.clear();
+            }
+        }
+        
         if (audio_input_need_warmup_) {
             audio_input_need_warmup_ = false;
             vTaskDelay(pdMS_TO_TICKS(120));
             continue;
         }
 
-        /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
+        // 如果没有任务处于活动状态，短暂休眠
+        if (!(bits & (AS_EVENT_AUDIO_TESTING_RUNNING | 
+                     AS_EVENT_WAKE_WORD_RUNNING | 
+                     AS_EVENT_AUDIO_PROCESSOR_RUNNING))) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        /* 音频测试处理 */
         if (bits & AS_EVENT_AUDIO_TESTING_RUNNING) {
             if (audio_testing_queue_.size() >= AUDIO_TESTING_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS) {
                 ESP_LOGW(TAG, "Audio testing queue is full, stopping audio testing");
@@ -221,7 +283,8 @@ void AudioService::AudioInputTask() {
             std::vector<int16_t> data;
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
-                // If input channels is 2, we need to fetch the left channel data
+                input_count++; // 增加计数
+                // 处理双通道
                 if (codec_->input_channels() == 2) {
                     auto mono_data = std::vector<int16_t>(data.size() / 2);
                     for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
@@ -234,32 +297,34 @@ void AudioService::AudioInputTask() {
             }
         }
 
-        /* Feed the wake word */
+        /* 唤醒词检测处理 */
         if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
             std::vector<int16_t> data;
             int samples = wake_word_->GetFeedSize();
             if (samples > 0) {
                 if (ReadAudioData(data, 16000, samples)) {
+                    input_count++; // 增加计数
                     wake_word_->Feed(data);
                     continue;
                 }
             }
         }
 
-        /* Feed the audio processor */
+        /* 音频处理器处理 */
         if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
             std::vector<int16_t> data;
             int samples = audio_processor_->GetFeedSize();
             if (samples > 0) {
                 if (ReadAudioData(data, 16000, samples)) {
+                    input_count++; // 增加计数
                     audio_processor_->Feed(std::move(data));
                     continue;
                 }
             }
         }
 
-        ESP_LOGE(TAG, "Should not be here, bits: %lx", bits);
-        break;
+        // 没有处理任何数据，短暂延迟避免CPU占用
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 
     ESP_LOGW(TAG, "Audio input task stopped");
@@ -460,12 +525,31 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
     return nullptr;
 }
 
+// 在AudioService类中添加或修改以下方法
+
+// 关键改进：实现无缝状态转换
+// 改进 EnableWakeWordDetection 方法
+// 在 AudioService 类中添加或修改以下方法
+
 void AudioService::EnableWakeWordDetection(bool enable) {
     if (!wake_word_) {
         return;
     }
 
-    ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
+    ESP_LOGI(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
+    
+    // 始终先停止所有音频处理
+    if (IsAudioProcessorRunning()) {
+        EnableVoiceProcessing(false);
+    }
+    
+    // 清空所有音频队列
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        audio_decode_queue_.clear();
+        audio_encode_queue_.clear();
+    }
+    
     if (enable) {
         if (!wake_word_initialized_) {
             if (!wake_word_->Initialize(codec_)) {
@@ -474,32 +558,71 @@ void AudioService::EnableWakeWordDetection(bool enable) {
             }
             wake_word_initialized_ = true;
         }
+        
+        // 重置音频输入状态
+        codec_->EnableInput(false);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        codec_->EnableInput(true);
+        
+        // 短暂延迟，确保硬件稳定
+        vTaskDelay(pdMS_TO_TICKS(30));
+        
+        // 启动唤醒词检测
         wake_word_->Start();
         xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
     } else {
+        // 停止唤醒词检测
         wake_word_->Stop();
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        
+        // 最关键的修复：关闭音频输入，防止数据继续积累
+        codec_->EnableInput(false);
     }
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
-    ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
+    ESP_LOGI(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
+    
+    // 始终先停止所有其他音频处理
+    if (IsWakeWordRunning()) {
+        EnableWakeWordDetection(false);
+    }
+    
+    // 清空所有音频队列
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        audio_decode_queue_.clear();
+        audio_encode_queue_.clear();
+    }
+    
     if (enable) {
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS);
             audio_processor_initialized_ = true;
         }
-
-        /* We should make sure no audio is playing */
-        ResetDecoder();
-        audio_input_need_warmup_ = true;
+        
+        // 重置音频输入状态
+        codec_->EnableInput(false);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        codec_->EnableInput(true);
+        
+        // 短暂延迟，确保硬件稳定
+        vTaskDelay(pdMS_TO_TICKS(30));
+        
+        // 启动音频处理
         audio_processor_->Start();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
+        // 停止音频处理
         audio_processor_->Stop();
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        
+        // 关闭音频输入，防止数据继续积累
+        codec_->EnableInput(false);
     }
 }
+
+
 
 void AudioService::EnableAudioTesting(bool enable) {
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");

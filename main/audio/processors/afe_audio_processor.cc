@@ -114,27 +114,87 @@ void AfeAudioProcessor::OnVadStateChange(std::function<void(bool speaking)> call
     vad_state_change_callback_ = callback;
 }
 
+// 修改 AudioProcessorTask 方法以优化性能和稳定性
+// 修正日志语句中的格式说明符，将 %d 更改为 %lu 或进行类型转换
 void AfeAudioProcessor::AudioProcessorTask() {
     auto fetch_size = afe_iface_->get_fetch_chunksize(afe_data_);
     auto feed_size = afe_iface_->get_feed_chunksize(afe_data_);
-    ESP_LOGI(TAG, "Audio communication task started, feed size: %d fetch size: %d",
-        feed_size, fetch_size);
+    ESP_LOGI(TAG, "Audio communication task started, feed size: %lu fetch size: %lu",
+        (unsigned long)feed_size, (unsigned long)fetch_size);
+
+    // 缓冲区管理变量
+    int consecutive_errors = 0;
+    const int MAX_CONSECUTIVE_ERRORS = 5;
+    TickType_t last_reset_time = xTaskGetTickCount();
+    const TickType_t RESET_INTERVAL = pdMS_TO_TICKS(2000); // 2秒
+    
+    // 性能统计变量
+    int processed_frames = 0;
+    TickType_t last_stats_time = xTaskGetTickCount();
+    const TickType_t STATS_INTERVAL = pdMS_TO_TICKS(5000); // 5秒
 
     while (true) {
-        xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING, pdFALSE, pdTRUE, portMAX_DELAY);
-
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
-        if ((xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) == 0) {
+        // 检查是否应该运行处理
+        EventBits_t bits = xEventGroupWaitBits(
+            event_group_, 
+            PROCESSOR_RUNNING, 
+            pdFALSE, 
+            pdTRUE, 
+            pdMS_TO_TICKS(10) // 短超时避免长时间阻塞
+        );
+        
+        if ((bits & PROCESSOR_RUNNING) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20)); // 不在运行状态时减少CPU使用
             continue;
         }
+
+        // 使用非阻塞方式获取数据
+        auto res = afe_iface_->fetch(afe_data_);
         if (res == nullptr || res->ret_value == ESP_FAIL) {
-            if (res != nullptr) {
-                ESP_LOGI(TAG, "Error code: %d", res->ret_value);
+            consecutive_errors++;
+            if (consecutive_errors > MAX_CONSECUTIVE_ERRORS) {
+                ESP_LOGW(TAG, "Too many consecutive fetch errors (%d), resetting buffer", 
+                         consecutive_errors);
+                afe_iface_->reset_buffer(afe_data_);
+                consecutive_errors = 0;
             }
+            vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
+        consecutive_errors = 0;
+        processed_frames++;
 
-        // VAD state change
+        // 周期性缓冲区维护
+        TickType_t current_time = xTaskGetTickCount();
+        if (current_time - last_reset_time > RESET_INTERVAL) {
+            // 检查输出缓冲区大小，防止溢出
+            if (output_buffer_.size() > frame_samples_ * 3) {
+                ESP_LOGW(TAG, "Output buffer too large (%zu samples), truncating", 
+                         output_buffer_.size());
+                // 保留最新的一帧数据
+                if (output_buffer_.size() > frame_samples_) {
+                    output_buffer_.erase(output_buffer_.begin(), 
+                                       output_buffer_.end() - frame_samples_);
+                } else {
+                    output_buffer_.clear();
+                }
+                output_buffer_.reserve(frame_samples_);
+            }
+            last_reset_time = current_time;
+        }
+        
+        // 周期性性能统计 - 修正格式说明符
+        if (current_time - last_stats_time > STATS_INTERVAL) {
+            // 将 TickType_t 转换为 int 以匹配 %d 格式说明符
+            ESP_LOGI(TAG, "Processed %d frames in last %d ms, buffer size: %zu samples", 
+                     processed_frames, 
+                     (int)pdTICKS_TO_MS(STATS_INTERVAL),
+                     output_buffer_.size());
+            processed_frames = 0;
+            last_stats_time = current_time;
+        }
+
+        // VAD 状态变化处理
         if (vad_state_change_callback_) {
             if (res->vad_state == VAD_SPEECH && !is_speaking_) {
                 is_speaking_ = true;
@@ -145,23 +205,30 @@ void AfeAudioProcessor::AudioProcessorTask() {
             }
         }
 
+        // 处理输出数据
         if (output_callback_) {
             size_t samples = res->data_size / sizeof(int16_t);
             
-            // Add data to buffer
+            // 添加数据到缓冲区
             output_buffer_.insert(output_buffer_.end(), res->data, res->data + samples);
             
-            // Output complete frames when buffer has enough data
+            // 输出完整帧
             while (output_buffer_.size() >= frame_samples_) {
                 if (output_buffer_.size() == frame_samples_) {
-                    // If buffer size equals frame size, move the entire buffer
+                    // 移动整个缓冲区
                     output_callback_(std::move(output_buffer_));
                     output_buffer_.clear();
                     output_buffer_.reserve(frame_samples_);
                 } else {
-                    // If buffer size exceeds frame size, copy one frame and remove it
-                    output_callback_(std::vector<int16_t>(output_buffer_.begin(), output_buffer_.begin() + frame_samples_));
-                    output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
+                    // 复制一帧并移除它
+                    output_callback_(std::vector<int16_t>(
+                        output_buffer_.begin(), 
+                        output_buffer_.begin() + frame_samples_
+                    ));
+                    output_buffer_.erase(
+                        output_buffer_.begin(), 
+                        output_buffer_.begin() + frame_samples_
+                    );
                 }
             }
         }

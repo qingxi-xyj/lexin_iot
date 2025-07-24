@@ -5,10 +5,10 @@
 cmake_minimum_required(VERSION 3.16)
 
 set(PROJECT_VER "1.8.2")
-
+# 在项目配置之前添加
+set(EXTRA_COMPONENT_DIRS ${CMAKE_CURRENT_LIST_DIR}/components)
 # Add this line to disable the specific warning
 add_compile_options(-Wno-missing-field-initializers)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(xiaozhi)
-

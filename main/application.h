@@ -16,7 +16,8 @@
 #include "ota.h"
 #include "audio_service.h"
 #include "device_state_event.h"
-
+// 在现有的包含文件下添加
+#include "assistant/voice_photo_assistant.h"
 #define MAIN_EVENT_SCHEDULE (1 << 0)
 #define MAIN_EVENT_SEND_AUDIO (1 << 1)
 #define MAIN_EVENT_WAKE_WORD_DETECTED (1 << 2)
@@ -52,6 +53,11 @@ public:
     void StartListening();
     void StopListening();
     void Reboot();
+        // 新增方法
+            // 设置聊天消息
+    void SetChatMessage(const char* role, const char* message);
+    void InitializeVoicePhotoAssistant();
+    void OnVoicePhotoAssistantStateChanged(AssistantState state);
     void WakeWordInvoke(const std::string& wake_word);
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);

@@ -8,22 +8,94 @@
 #include <esp_heap_caps.h>
 #include <img_converters.h>
 #include <cstring>
+#include <esp_timer.h>
 
 #define TAG "Esp32Camera"
 
+// 检测相机型号的辅助函数
+bool detect_and_configure_camera(sensor_t* s) {
+    if (s == nullptr) {
+        ESP_LOGE(TAG, "Failed to get camera sensor");
+        return false;
+    }
+    
+    // 记录相机信息以便调试
+    ESP_LOGI(TAG, "Camera sensor info - PID: 0x%x, VER: 0x%x, MIDL: 0x%x, MIDH: 0x%x", 
+             s->id.PID, s->id.VER, s->id.MIDL, s->id.MIDH);
+    
+    // 根据相机型号应用特定设置
+    if (s->id.PID == GC0308_PID) {
+        ESP_LOGI(TAG, "Detected GC0308 camera");
+        s->set_hmirror(s, 0);  // 设置水平镜像
+    } else if (s->id.PID == OV2640_PID) {
+        ESP_LOGI(TAG, "Detected OV2640 camera");
+    } else if (s->id.PID == OV3660_PID) {
+        ESP_LOGI(TAG, "Detected OV3660 camera");
+    } else {
+        ESP_LOGW(TAG, "Unknown camera model (PID: 0x%x), applying generic settings", s->id.PID);
+    }
+    
+    // 应用通用相机优化设置
+    s->set_brightness(s, 1);     // 略微增加亮度
+    s->set_contrast(s, 1);       // 略微增加对比度
+    s->set_saturation(s, 0);     // 默认饱和度
+    s->set_gainceiling(s, GAINCEILING_2X); // 增益上限
+    s->set_quality(s, 10);       // 降低JPEG质量以提高帧率
+    s->set_colorbar(s, 0);       // 禁用彩条测试
+    s->set_whitebal(s, 1);       // 启用白平衡
+    s->set_gain_ctrl(s, 1);      // 自动增益控制
+    s->set_exposure_ctrl(s, 1);  // 自动曝光控制
+    s->set_aec2(s, 1);           // 增强型自动曝光
+    
+    return true;
+}
+
 Esp32Camera::Esp32Camera(const camera_config_t& config) {
-    // camera init
-    esp_err_t err = esp_camera_init(&config); // 配置上面定义的参数
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
+    // 尝试多种初始化策略
+    bool camera_init_success = false;
+    
+    for (int attempt = 0; attempt < 3 && !camera_init_success; attempt++) {
+        ESP_LOGI(TAG, "Camera initialization attempt %d/3", attempt + 1);
+        
+        // 根据尝试次数修改配置
+        camera_config_t adjusted_config = config;
+        
+        if (attempt == 1) {
+            // 第二次尝试：降低时钟频率
+            adjusted_config.xclk_freq_hz = 10000000; // 降至10MHz
+            ESP_LOGI(TAG, "Trying with reduced clock frequency: %d Hz", adjusted_config.xclk_freq_hz);
+        } else if (attempt == 2) {
+            // 第三次尝试：改变像素格式
+            adjusted_config.pixel_format = PIXFORMAT_RGB565;
+            ESP_LOGI(TAG, "Trying with RGB565 pixel format");
+        }
+        
+        // 相机初始化
+        esp_err_t err = esp_camera_init(&adjusted_config);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Camera init failed on attempt %d with error 0x%x", attempt + 1, err);
+            // 在重试前等待一小段时间
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        
+        // 相机初始化成功，尝试获取和配置传感器
+        sensor_t *s = esp_camera_sensor_get();
+        if (detect_and_configure_camera(s)) {
+            camera_init_success = true;
+            ESP_LOGI(TAG, "Camera initialized successfully on attempt %d", attempt + 1);
+        } else {
+            // 传感器配置失败，释放资源并重试
+            esp_camera_deinit();
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    
+    if (!camera_init_success) {
+        ESP_LOGE(TAG, "All camera initialization attempts failed");
         return;
     }
-
-    sensor_t *s = esp_camera_sensor_get(); // 获取摄像头型号
-    if (s->id.PID == GC0308_PID) {
-        s->set_hmirror(s, 0);  // 这里控制摄像头镜像 写1镜像 写0不镜像
-    }
-
+    
     // 初始化预览图片的内存
     memset(&preview_image_, 0, sizeof(preview_image_));
     preview_image_.header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -85,47 +157,98 @@ void Esp32Camera::SetExplainUrl(const std::string& url, const std::string& token
 }
 
 bool Esp32Camera::Capture() {
+    // 等待上一个编码线程完成
     if (encoder_thread_.joinable()) {
         encoder_thread_.join();
     }
-
-    int frames_to_get = 2;
-    // Try to get a stable frame
-    for (int i = 0; i < frames_to_get; i++) {
+    
+    // 检查相机传感器可用性
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == nullptr) {
+        ESP_LOGE(TAG, "Camera sensor not available");
+        return false;
+    }
+    
+    // 检查并释放之前的帧缓冲区
+    if (fb_ != nullptr) {
+        esp_camera_fb_return(fb_);
+        fb_ = nullptr;
+    }
+    
+    // 添加捕获延迟控制
+    static int64_t last_capture_time = 0;
+    int64_t current_time = esp_timer_get_time() / 1000;
+    if (current_time - last_capture_time < 100) { // 至少间隔100ms
+        vTaskDelay(pdMS_TO_TICKS(100 - (current_time - last_capture_time)));
+    }
+    
+    // 尝试多次捕获，提高成功率
+    for (int retry = 0; retry < 3; retry++) {
+        // 捕获多帧以稳定图像
+        for (int i = 0; i < 2; i++) {
+            if (fb_ != nullptr) {
+                esp_camera_fb_return(fb_);
+                fb_ = nullptr;
+            }
+            
+            fb_ = esp_camera_fb_get();
+            if (fb_ == nullptr) {
+                ESP_LOGW(TAG, "Camera capture failed, retry %d/3", retry + 1);
+                vTaskDelay(pdMS_TO_TICKS(20)); // 短暂延迟
+                continue;
+            }
+            
+            // 捕获成功，等待一小段时间使图像稳定
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        
         if (fb_ != nullptr) {
-            esp_camera_fb_return(fb_);
+            // 捕获成功
+            last_capture_time = esp_timer_get_time() / 1000;
+            ESP_LOGI(TAG, "Camera capture successful: %dx%d, format: %d, len: %d", 
+                     fb_->width, fb_->height, fb_->format, fb_->len);
+            break;
         }
-        fb_ = esp_camera_fb_get();
-        if (fb_ == nullptr) {
-            ESP_LOGE(TAG, "Camera capture failed");
-            return false;
+        
+        // 如果是最后一次尝试前，重置相机设置
+        if (retry == 1) {
+            ESP_LOGW(TAG, "Multiple capture failures, resetting camera settings");
+            s->set_hmirror(s, 0);  // 重置镜像设置
+            s->set_vflip(s, 0);    // 重置翻转设置
+            s->set_brightness(s, 0); // 重置亮度
+            vTaskDelay(pdMS_TO_TICKS(100));
+            s->set_brightness(s, 1); // 恢复亮度
         }
+        
+        vTaskDelay(pdMS_TO_TICKS(100)); // 重试前等待
     }
-
-    // 如果预览图片 buffer 为空，则跳过预览
-    // 但仍返回 true，因为此时图像可以上传至服务器
-    if (preview_image_.data_size == 0) {
-        ESP_LOGW(TAG, "Skip preview because of unsupported frame size");
-        return true;
+    
+    // 检查最终结果
+    if (fb_ == nullptr) {
+        ESP_LOGE(TAG, "Camera capture failed after multiple attempts");
+        return false;
     }
-    if (preview_image_.data == nullptr) {
-        ESP_LOGE(TAG, "Preview image data is not initialized");
-        return true;
-    }
-    // 显示预览图片
-    auto display = Board::GetInstance().GetDisplay();
-    if (display != nullptr) {
-        auto src = (uint16_t*)fb_->buf;
-        auto dst = (uint16_t*)preview_image_.data;
-        size_t pixel_count = fb_->len / 2;
-        for (size_t i = 0; i < pixel_count; i++) {
-            // 交换每个16位字内的字节
-            dst[i] = __builtin_bswap16(src[i]);
+    
+    // 处理预览图像
+    if (preview_image_.data_size > 0 && preview_image_.data != nullptr) {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            auto src = (uint16_t*)fb_->buf;
+            auto dst = (uint16_t*)preview_image_.data;
+            size_t pixel_count = fb_->len / 2;
+            for (size_t i = 0; i < pixel_count; i++) {
+                // 交换每个16位字内的字节
+                dst[i] = __builtin_bswap16(src[i]);
+            }
+            display->SetPreviewImage(&preview_image_);
         }
-        display->SetPreviewImage(&preview_image_);
+    } else {
+        ESP_LOGW(TAG, "Skip preview because of unsupported frame size or uninitialized data");
     }
+    
     return true;
 }
+
 bool Esp32Camera::SetHMirror(bool enabled) {
     sensor_t *s = esp_camera_sensor_get();
     if (s == nullptr) {
@@ -160,53 +283,60 @@ bool Esp32Camera::SetVFlip(bool enabled) {
     return true;
 }
 
-/**
- * @brief 将摄像头捕获的图像发送到远程服务器进行AI分析和解释
- * 
- * 该函数将当前摄像头缓冲区中的图像编码为JPEG格式，并通过HTTP POST请求
- * 以multipart/form-data的形式发送到指定的解释服务器。服务器将根据提供的
- * 问题对图像进行AI分析并返回结果。
- * 
- * 实现特点：
- * - 使用独立线程编码JPEG，与主线程分离
- * - 采用分块传输编码(chunked transfer encoding)优化内存使用
- * - 通过队列机制实现编码线程和发送线程的数据同步
- * - 支持设备ID、客户端ID和认证令牌的HTTP头部配置
- * 
- * @param question 要向AI提出的关于图像的问题，将作为表单字段发送
- * @return std::string 服务器返回的JSON格式响应字符串
- *         成功时包含AI分析结果，失败时包含错误信息
- *         格式示例：{"success": true, "result": "分析结果"}
- *                  {"success": false, "message": "错误信息"}
- * 
- * @note 调用此函数前必须先调用SetExplainUrl()设置服务器URL
- * @note 函数会等待之前的编码线程完成后再开始新的处理
- * @warning 如果摄像头缓冲区为空或网络连接失败，将返回错误信息
- */
 std::string Esp32Camera::Explain(const std::string& question) {
+    // 检查相机状态并尝试捕获
+    if (fb_ == nullptr) {
+        ESP_LOGW(TAG, "No camera frame available, attempting to capture");
+        if (!Capture()) {
+            return "{\"success\": false, \"message\": \"Failed to capture image from camera\"}";
+        }
+    }
+    
     if (explain_url_.empty()) {
         return "{\"success\": false, \"message\": \"Image explain URL or token is not set\"}";
     }
 
-    // 创建局部的 JPEG 队列, 40 entries is about to store 512 * 40 = 20480 bytes of JPEG data
+    // 创建局部的 JPEG 队列
     QueueHandle_t jpeg_queue = xQueueCreate(40, sizeof(JpegChunk));
     if (jpeg_queue == nullptr) {
         ESP_LOGE(TAG, "Failed to create JPEG queue");
         return "{\"success\": false, \"message\": \"Failed to create JPEG queue\"}";
     }
 
-    // We spawn a thread to encode the image to JPEG
+    // 在独立线程中编码图像为JPEG
     encoder_thread_ = std::thread([this, jpeg_queue]() {
+        // 确保fb_有效
+        if (fb_ == nullptr) {
+            ESP_LOGE(TAG, "Frame buffer is null in encoder thread");
+            JpegChunk end_marker = {.data = nullptr, .len = 0};
+            xQueueSend(jpeg_queue, &end_marker, portMAX_DELAY);
+            return;
+        }
+        
+        // 将帧缓冲区转换为JPEG
         frame2jpg_cb(fb_, 80, [](void* arg, size_t index, const void* data, size_t len) -> unsigned int {
             auto jpeg_queue = (QueueHandle_t)arg;
-            JpegChunk chunk = {
-                .data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM),
-                .len = len
-            };
+            if (data == nullptr || len == 0) {
+                return 0;
+            }
+            
+            // 分配内存存储JPEG块
+            JpegChunk chunk;
+            chunk.data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM);
+            if (chunk.data == nullptr) {
+                ESP_LOGE(TAG, "Failed to allocate memory for JPEG chunk");
+                return 0;
+            }
+            
+            chunk.len = len;
             memcpy(chunk.data, data, len);
             xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
             return len;
         }, jpeg_queue);
+        
+        // 发送结束标记
+        JpegChunk end_marker = {.data = nullptr, .len = 0};
+        xQueueSend(jpeg_queue, &end_marker, portMAX_DELAY);
     });
 
     auto network = Board::GetInstance().GetNetwork();
@@ -224,7 +354,7 @@ std::string Esp32Camera::Explain(const std::string& question) {
     http->SetHeader("Transfer-Encoding", "chunked");
     if (!http->Open("POST", explain_url_)) {
         ESP_LOGE(TAG, "Failed to connect to explain URL");
-        // Clear the queue
+        // 清理队列
         encoder_thread_.join();
         JpegChunk chunk;
         while (xQueueReceive(jpeg_queue, &chunk, portMAX_DELAY) == pdPASS) {
@@ -272,7 +402,7 @@ std::string Esp32Camera::Explain(const std::string& question) {
         total_sent += chunk.len;
         heap_caps_free(chunk.data);
     }
-    // Wait for the encoder thread to finish
+    // 等待编码线程完成
     encoder_thread_.join();
     // 清理队列
     vQueueDelete(jpeg_queue);
@@ -294,7 +424,7 @@ std::string Esp32Camera::Explain(const std::string& question) {
     std::string result = http->ReadAll();
     http->Close();
 
-    // Get remain task stack size
+    // 获取剩余任务栈大小
     size_t remain_stack_size = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(TAG, "Explain image size=%dx%d, compressed size=%d, remain stack size=%d, question=%s\n%s",
         fb_->width, fb_->height, total_sent, remain_stack_size, question.c_str(), result.c_str());

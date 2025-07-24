@@ -79,20 +79,57 @@ bool AfeWakeWord::Initialize(AudioCodec* codec) {
     return true;
 }
 
-void AfeWakeWord::OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) {
-    wake_word_detected_callback_ = callback;
+// 无参数版本的 OnWakeWordDetected 函数
+void AfeWakeWord::OnWakeWordDetected() {
+    ESP_LOGI(TAG, "Wake word detected, starting to listen");
+    
+    // 获取语音助手实例并检查其状态
+    auto& assistant = VoicePhotoAssistant::GetInstance();
+    if (assistant.GetState() != kStateIdle && 
+        assistant.GetState() != kStateSpeaking) {
+        ESP_LOGI(TAG, "Wake word detected but assistant is already active, ignoring");
+        return;
+    }
+    
+    // 通知助手已检测到唤醒词
+    assistant.OnWakeWord();
+    
+    // 编码唤醒词音频数据
+    EncodeWakeWordData();
+}
+
+// 带回调参数版本的 OnWakeWordDetected 函数
+void AfeWakeWord::OnWakeWordDetected(std::function<void(const std::string&)> callback) {
+    ESP_LOGI(TAG, "Wake word detected with callback");
+    
+    // 获取语音助手实例并检查其状态
+    auto& assistant = VoicePhotoAssistant::GetInstance();
+    if (assistant.GetState() != kStateIdle && 
+        assistant.GetState() != kStateSpeaking) {
+        ESP_LOGI(TAG, "Wake word detected but assistant is already active, ignoring");
+        return;
+    }
+    
+    // 使用固定的唤醒词，因为 GetLastWakeWord() 不可用
+    const std::string wake_word = "你好小智"; // 使用默认唤醒词
+    
+    // 调用回调函数
+    if (callback) {
+        callback(wake_word);
+    }
+    
+    // 通知助手已检测到唤醒词
+    assistant.OnWakeWord();
+    
+    // 编码唤醒词音频数据
+    EncodeWakeWordData();
 }
 
 void AfeWakeWord::Start() {
     xEventGroupSetBits(event_group_, DETECTION_RUNNING_EVENT);
 }
 
-void AfeWakeWord::Stop() {
-    xEventGroupClearBits(event_group_, DETECTION_RUNNING_EVENT);
-    if (afe_data_ != nullptr) {
-        afe_iface_->reset_buffer(afe_data_);
-    }
-}
+
 
 void AfeWakeWord::Feed(const std::vector<int16_t>& data) {
     if (afe_data_ == nullptr) {
@@ -108,27 +145,77 @@ size_t AfeWakeWord::GetFeedSize() {
     return afe_iface_->get_feed_chunksize(afe_data_) * codec_->input_channels();
 }
 
+// 优化 AudioDetectionTask 方法
+// 优化 AudioDetectionTask 方法
 void AfeWakeWord::AudioDetectionTask() {
     auto fetch_size = afe_iface_->get_fetch_chunksize(afe_data_);
     auto feed_size = afe_iface_->get_feed_chunksize(afe_data_);
     ESP_LOGI(TAG, "Audio detection task started, feed size: %d fetch size: %d",
         feed_size, fetch_size);
 
-    while (true) {
-        xEventGroupWaitBits(event_group_, DETECTION_RUNNING_EVENT, pdFALSE, pdTRUE, portMAX_DELAY);
+    // 缓冲区管理变量
+    int consecutive_errors = 0;
+    const int MAX_CONSECUTIVE_ERRORS = 5;
+    TickType_t last_reset_time = xTaskGetTickCount();
+    const TickType_t RESET_INTERVAL = pdMS_TO_TICKS(500); // 每500ms检查一次
 
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
-        if (res == nullptr || res->ret_value == ESP_FAIL) {
-            continue;;
+    while (true) {
+        // 短超时检查状态
+        EventBits_t bits = xEventGroupWaitBits(
+            event_group_, 
+            DETECTION_RUNNING_EVENT, 
+            pdFALSE, 
+            pdTRUE, 
+            pdMS_TO_TICKS(10)
+        );
+        
+        if ((bits & DETECTION_RUNNING_EVENT) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
-        // Store the wake word data for voice recognition, like who is speaking
+        // 获取数据
+        auto res = afe_iface_->fetch(afe_data_);
+        
+        // 错误处理
+        if (res == nullptr || res->ret_value == ESP_FAIL) {
+            consecutive_errors++;
+            if (consecutive_errors > MAX_CONSECUTIVE_ERRORS) {
+                ESP_LOGW(TAG, "Multiple fetch errors (%d), resetting AFE buffer", 
+                         consecutive_errors);
+                afe_iface_->reset_buffer(afe_data_);
+                consecutive_errors = 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        consecutive_errors = 0;
+
+        // 周期性缓冲区维护 - 更频繁重置缓冲区
+        TickType_t current_time = xTaskGetTickCount();
+        if (current_time - last_reset_time > RESET_INTERVAL) {
+            ESP_LOGD(TAG, "Performing routine buffer reset");
+            afe_iface_->reset_buffer(afe_data_);
+            last_reset_time = current_time;
+        }
+
+        // 存储唤醒词数据 - 限制存储量
         StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
 
+        // 唤醒词检测
         if (res->wakeup_state == WAKENET_DETECTED) {
+            ESP_LOGI(TAG, "Wake word detected!");
+            
+            // 立即重置缓冲区
+            afe_iface_->reset_buffer(afe_data_);
+            
+            // 停止检测
             Stop();
+            
+            // 设置检测到的唤醒词
             last_detected_wake_word_ = wake_words_[res->wakenet_model_index - 1];
 
+            // 执行回调
             if (wake_word_detected_callback_) {
                 wake_word_detected_callback_(last_detected_wake_word_);
             }
@@ -136,12 +223,28 @@ void AfeWakeWord::AudioDetectionTask() {
     }
 }
 
+// 优化 StoreWakeWordData 方法
 void AfeWakeWord::StoreWakeWordData(const int16_t* data, size_t samples) {
-    // store audio data to wake_word_pcm_
-    wake_word_pcm_.emplace_back(std::vector<int16_t>(data, data + samples));
-    // keep about 2 seconds of data, detect duration is 30ms (sample_rate == 16000, chunksize == 512)
-    while (wake_word_pcm_.size() > 2000 / 30) {
+    static const size_t MAX_BUFFER_SIZE = 1500 / 30;  // 约1.5秒的数据
+    
+    // 限制队列大小
+    if (wake_word_pcm_.size() >= MAX_BUFFER_SIZE) {
         wake_word_pcm_.pop_front();
+    }
+    
+    // 添加新数据
+    wake_word_pcm_.emplace_back(std::vector<int16_t>(data, data + samples));
+}
+
+// 优化 Stop 方法
+void AfeWakeWord::Stop() {
+    ESP_LOGI(TAG, "Stopping wake word detection");
+    xEventGroupClearBits(event_group_, DETECTION_RUNNING_EVENT);
+    
+    // 重置缓冲区
+    if (afe_data_ != nullptr) {
+        ESP_LOGI(TAG, "Fully resetting AFE buffer on stop");
+        afe_iface_->reset_buffer(afe_data_);
     }
 }
 
@@ -159,11 +262,23 @@ void AfeWakeWord::EncodeWakeWordData() {
 
             int packets = 0;
             for (auto& pcm: this_->wake_word_pcm_) {
-                encoder->Encode(std::move(pcm), [this_](std::vector<uint8_t>&& opus) {
-                    std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
-                    this_->wake_word_opus_.emplace_back(std::move(opus));
-                    this_->wake_word_cv_.notify_all();
-                });
+                std::vector<uint8_t> opus_data;
+                // 确保PCM数据有效且不为空
+                if (!pcm.empty()) {
+                    try {
+                        if (encoder->Encode(std::move(pcm), opus_data)) {
+                            if (!opus_data.empty()) {
+                                std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
+                                this_->wake_word_opus_.emplace_back(std::move(opus_data));
+                                this_->wake_word_cv_.notify_all();
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        ESP_LOGE(TAG, "Exception during encoding: %s", e.what());
+                    } catch (...) {
+                        ESP_LOGE(TAG, "Unknown exception during encoding");
+                    }
+                }
                 packets++;
             }
             this_->wake_word_pcm_.clear();

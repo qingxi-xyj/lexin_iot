@@ -7,7 +7,7 @@
 
 #include <esp_log.h>
 #include <esp_timer.h>
-#include <opus_encoder.h>
+//#include <opus_encoder.h>
 
 static const char *TAG = "Ml307Board";
 
